@@ -1,0 +1,250 @@
+#!/sbin/sh
+
+OUTFD=/proc/self/fd/$2
+ZIPFILE="$3"
+DIR=$(dirname "$ZIPFILE")
+
+# ui_print "<message>" ["<message 2>" ...]
+ui_print() {
+  while [ "$1" ]; do
+    echo -e "ui_print $1
+      ui_print" >> $OUTFD
+    shift
+  done
+}
+
+# show_progress <amount> <time>
+show_progress() {
+  echo "progress $1 $2" >> $OUTFD
+}
+
+# set_progress <amount>
+set_progress() {
+  echo "set_progress $1" >> $OUTFD
+}
+
+# is_mounted <partition>
+is_mounted() {
+  test "$(mount | grep " $1 ")" && echo 1 || echo 0
+}
+
+# unmount /system
+unmount_system() {
+  umount /system
+  umount /system_root
+}
+
+# unmount /vendor
+unmount_vendor() {
+  umount /vendor
+}
+
+# mount /system
+mount_system() {
+  unmount_system
+  mount -o rw /dev/block/bootdevice/by-name/system /system_root
+  mount /system_root/system /system
+}
+
+# mount /vendor
+mount_vendor() {
+  unmount_vendor
+  mount -o rw /dev/block/bootdevice/by-name/vendor /vendor
+}
+
+# package_extract_file <file> <destination_file>
+package_extract_file() {
+  mkdir -p "$(dirname "$2")"
+  unzip -o "$ZIPFILE" "$1" -p > "$2"
+}
+
+# package_extract_dir <dir> <destination_dir>
+package_extract_dir() {
+  local entry outfile
+  for entry in $(unzip -l "$ZIPFILE" "$1/*" 2>/dev/null | tail -n+4 | grep -v '/$' | grep -o " $1.*$" | cut -c2-); do
+    outfile="$(echo "$entry" | sed "s|${1}|${2}|")"
+    mkdir -p "$(dirname "$outfile")"
+    unzip -o "$ZIPFILE" "$entry" -p > "$outfile"
+  done
+}
+
+# file_getprop <file> <property>
+file_getprop() {
+  grep "^$2=" "$1" | cut -d= -f2-
+}
+
+# getprop <property>
+getprop() {
+  test -e /sbin/getprop && /sbin/getprop $1 || grep "^$1=" /default.prop | cut -d= -f2
+}
+
+# abort [<message>]
+abort() {
+  ui_print "$*"
+  exit 1
+}
+
+# backup_files <file> [<file2> ...]
+backup_files() {
+  while [ "$1" ]; do
+    test ! -e "$1.bak" && cp -pf "$1" "$1.bak"
+    shift
+  done
+}
+
+# restore_files <file> [<file2> ...]
+restore_files() {
+  while [ "$1" ]; do
+    mv -f "${1}.bak" "$1"
+    shift
+  done
+}
+
+# debloat <bloatware.list>
+debloat() {
+  echo "" >> "$1"
+  sed -r '/(^#|^ *$)/d' "$1" | while read line; do
+    if [[ -e "/system/app/$line" ]]; then
+      rm -rf "/system/app/$line"
+    fi
+    if [[ -e "/system/priv-app/$line" ]]; then
+      rm -rf "/system/priv-app/$line"
+    fi
+    if [[ -e "/system/product/app/$line" ]]; then
+      rm -rf "/system/product/app/$line"
+    fi
+    if [[ -e "/system/product/priv-app/$line" ]]; then
+      rm -rf "/system/product/priv-app/$line"
+    fi
+  done
+}
+
+# edit_prop <src> <dest>
+#
+# entry=value  : if entry already present in conf, override value in conf if different otherwise append entry to conf.
+# @entry|value : append value to entry's value if present in conf.
+# $entry=value : change value if and only if entry exists.
+# !entry       : remove entry from conf if present.
+# >entry       : forcefully append to conf.
+# ~entry       : uncomment an entry from conf. (Only # is supported)
+#
+edit_prop() {
+  test -s "${1}"
+  # read only lines matching valid entry pattern
+  sed -r '/(^#|^ *$)/d;' "${1}" | while read line; do
+    # remove entry
+    if [[ "$line" =~ ^\! ]]; then
+      entry=$(echo "${line#?}" | sed -e 's%[\%&]%\\&%g')
+      # remove from $build if present
+      grep -q "$entry" "$2" && sed "/$entry/d" -i "$2"
+    # append string
+    elif [[ "$line" =~ ^\@ ]]; then
+      entry=$(echo "${line#?}" | sed -e 's%[\%&]%\\&%g')
+      var=$(echo "$entry" | cut -d\| -f1)
+      app=$(echo "$entry" | cut -d\| -f2)
+      # append string to $var's value if present in $build
+      grep -q "$var" "$2" && sed "s%^$var=.*$%&$app%" -i "$2"
+    # change value if and only if entry exists
+    elif [[ "$line" =~ ^\$ ]]; then
+      entry=$(echo "${line#?}" | sed -e 's%[\%&]%\\&%g')
+      var=$(echo "$entry" | cut -d\= -f1)
+      new=$(echo "$entry" | cut -d\= -f2)
+      # change $var's value iif $var present in $build
+      echo "$var:$new"
+      grep -q "$var=" "$2" && sed "s%^$var=.*$%$var=$new%" -i "$2"
+    # comment out a entry
+    elif [[ "$line" =~ ^\~ ]]; then
+      entry=$(echo "${line#?}" | sed -e 's%[\%&]%\\&%g')
+      sed -i "/^#\s*${entry}/ c${entry}" "${2}"
+    elif [[ "$line" =~ ^\> ]]; then
+      entry=$(echo "${line#?}" | sed -e 's%[\%&]%\\&%g')
+      echo "$entry" | tee -a "$2" 1>/dev/null
+    # add or override entry
+    else
+      var=$(echo "$line" | cut -d= -f1)
+      # if variable already present in $build
+      if grep -q "$var" "$2"; then
+        # override value in $build if different
+        grep -q "$(grep "$var" "$1")" "$2" || sed "s%^$var=.*$%$line%" -i "$2"
+      # else append entry to $build
+      else
+        echo "$line" | tee -a "$2" 1>/dev/null
+      fi
+    fi
+  done
+
+  # make prop permission to -rw-------
+  chmod 600 "$2"
+}
+
+# install apps from
+install_apps() {
+  for app in `find /tmp/apps -mindepth 1 -maxdepth 1 -type d`; do
+    APP="${app##*/}"
+    rm -rf "/system/app/$APP" "/system/priv-app/$APP"
+    rm -rf "/system/product/app/$APP" "/system/product/priv-app/$APP"
+    cp -rf "/tmp/apps/$APP" "/system/product/app/"
+    find "/system/product/app/$APP" -type d -exec chmod 755 {} +
+    find "/system/product/app/$APP" -type f -exec chmod 644 {} +
+  done
+}
+
+# clean before exit
+clean_env() {
+  rm -rf "/tmp/apps" "/tmp/config"
+}
+
+##############################################
+#                                            #
+#        MAIN PROGRAM STARTS FROM HERE       #
+#                                            #
+##############################################
+
+ui_print "+---------------------------------+"
+ui_print "|      AERIAL MOD FOR ANDROID     |"
+ui_print "|          By: Al Shakib          |"
+ui_print "+---------------------------------+"
+mount_system
+mount_vendor
+ui_print "+ Extracting files to /tmp"
+show_progress "0.2" "3"
+package_extract_dir "apps" "/tmp/apps"
+package_extract_dir "config" "/tmp/config"
+package_extract_dir "system" "/system"
+package_extract_dir "vendor" "/vendor"
+
+# remove bloatwares
+if [[ -e "/tmp/config/bloatware.list" ]]; then
+  ui_print "+ Debloating"
+  show_progress "0.3" "3"
+  debloat "/tmp/config/bloatware.list"
+fi
+
+# install apps
+if [ "$(ls -A "/tmp/apps")" ]; then
+  ui_print "+ Installing apps"
+  show_progress "0.7" "3"
+  install_apps
+fi
+
+# modify /system/build.prop
+if [[ -e "/tmp/config/system.prop" ]]; then
+  ui_print "+ Editing /system/build.prop"
+  show_progress "0.8" "2"
+  edit_prop "/tmp/config/system.prop" "/system/build.prop"
+fi
+
+# modify /vendor/build.prop
+if [[ -e "/tmp/config/vendor.prop" ]]; then
+  ui_print "+ Editing /vendor/build.prop"
+  show_progress "0.9" "2"
+  edit_prop "/tmp/config/system.prop" "/vendor/build.prop"
+fi
+
+ui_print "+ Cleaning up"
+clean_env
+ui_print "+ Unmounting /system /vendor"
+unmount_system
+unmount_vendor
+ui_print "+ Done"
+show_progress "1.0" "1"
