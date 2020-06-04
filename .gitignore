@@ -1,2 +1,5 @@
 out/*
 tmp/*
+apps/*
+system/*
+config/*
